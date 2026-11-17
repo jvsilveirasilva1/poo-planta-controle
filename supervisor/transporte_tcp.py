@@ -201,3 +201,41 @@ class ClienteTcpSupervisor:
                 quadros = enquadrador.receber_bytes(bloco)
                 if quadros:
                     return json.loads(quadros[0])
+
+
+def main() -> int:  # pragma: no cover
+    import argparse
+    import time
+
+    parser = argparse.ArgumentParser(description="Servidor TCP da Planta do Fermentador Cervejeiro")
+    parser.add_argument("--dados", type=Path, default=Path("dados"))
+    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--porta", type=int, default=9100)
+    parser.add_argument("--intervalo", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=7)
+    args = parser.parse_args()
+
+    planta = Planta(seed=args.seed)
+    servidor = ServidorTcpPlanta(planta, args.dados, host=args.host, porta=args.porta)
+    servidor.iniciar_em_background()
+    print(f"Servidor TCP da Planta ativo em {args.host}:{servidor.porta} (sessao={planta.sessao})", flush=True)
+    try:
+        while True:
+            time.sleep(args.intervalo)
+            estado = servidor.avancar_ciclo()
+            print(
+                f"[TCP] ciclo={estado['ciclo']} nivel={planta.nivel:.1f}% "
+                f"temperatura={planta.temperatura:.1f}C ack={planta.ultimo_comando}",
+                flush=True,
+            )
+    except KeyboardInterrupt:
+        pass
+    finally:
+        servidor.encerrar()
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    import sys
+
+    sys.exit(main())
