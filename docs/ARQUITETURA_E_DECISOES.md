@@ -521,6 +521,57 @@ stateDiagram-v2
 
 ---
 
+### 5.5. Extensão Bônus TCP: Enquadramento NDJSON, Fragmentação, Desconexão e Recuperação
+
+Para atender integralmente aos critérios do **Bônus TCP (+0,5 ponto)** sem substituir a versão obrigatória por arquivos:
+
+1. **Enquadramento (*Framing* por Delimitador `\n` — NDJSON)**:
+   - Sockets TCP (`SOCK_STREAM`) não preservam fronteiras de mensagens (`send()` $\neq$ `recv()`). Cada documento JSON do contrato é serializado sem quebras de linha internas e finalizado com `\n`.
+2. **Reconstrução de Fragmentos e Separação de Coalescência (`BufferEnquadramentoTcp` / `EnquadradorTcp`)**:
+   - Os bytes lidos em cada `recv()` são anexados a um buffer interno. O parser extrai um documento somente quando encontra `\n`.
+   - Se um `planta.json` ou `comando_planta.json` chegar fragmentado em múltiplos pacotes TCP (ex.: 3 a 7 bytes por vez), os pedaços aguardam no buffer até a chegada do `\n`.
+   - Se dois quadros chegarem concatenados no mesmo pacote TCP, o laço extrai ambos na ordem exata.
+   - Caso um fluxo defeituoso ultrapasse `64 KB` sem enviar `\n`, o buffer é limpo e lança exceção de *overflow*, evitando exaustão de memória.
+3. **Tratamento de Desconexão e Preservação de Sessão/Ciclo**:
+   - Em caso de queda de socket (`recv() <= 0` ou erro de escrita), `limparAoDesconectar()` descarta qualquer meio-quadro incompleto.
+   - Na tentativa seguinte, `ClienteTcpPlanta` abre nova conexão TCP automaticamente e o `Controlador` reconcilia `(sessao, ciclo, ultimo_comando)` via `GestorComandos`, retomando a sequência de IDs sem perder a sessão nem duplicar atuações.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Srv as ServidorTcpPlanta (Python)
+    participant Sock as Stream TCP (127.0.0.1)
+    participant Cli as ClienteTcpPlanta + BufferEnquadramentoTcp (C++)
+    participant Ctrl as Controlador + GestorComandos (C++)
+
+    Note over Srv,Ctrl: 1. Ciclo 1 com Fragmentação de Pacotes TCP
+    Ctrl->>Cli: requisitarSnapshotPlanta()
+    Cli->>Sock: send({"acao":"OBTER_PLANTA"}\n)
+    Sock->>Srv: Recebe pedido e obtém estado do Ciclo 1 (sessao="tcp-s1", ciclo=1)
+    Srv->>Sock: send(Parte 1/3 do JSON sem \n)
+    Sock->>Cli: recv() -> Buffer acumula Parte 1 (0 mensagens completas)
+    Srv->>Sock: send(Parte 2/3 do JSON sem \n)
+    Sock->>Cli: recv() -> Buffer acumula Parte 1+2 (0 mensagens completas)
+    Srv->>Sock: send(Parte 3/3 + \n)
+    Sock->>Cli: recv() -> Encontra \n e reconstrói JSON completo!
+    Cli-->>Ctrl: Entrega snapshot íntegro do Ciclo 1
+    Ctrl->>Cli: enviarComandoPlanta(id=1, bomba=100%, aquecedor=100%)
+    Cli->>Sock: send(comando_planta.json + \n)
+    Sock->>Srv: Aplica comando id=1 e responde {"status":"ok"}\n
+
+    Note over Srv,Ctrl: 2. Queda Abrupta da Conexão TCP e Recuperação no Ciclo 2
+    Srv-xSock: Queda de conexão (close / EOF)
+    Ctrl->>Cli: requisitarSnapshotPlanta() (Ciclo 2)
+    Cli->>Cli: Detecta socket desconectado -> limparAoDesconectar() (descarta lixo parcial)
+    Cli->>Sock: Reconecta automaticamente (connect 127.0.0.1:PORTA)
+    Cli->>Sock: send({"acao":"OBTER_PLANTA"}\n)
+    Srv->>Sock: send(planta.json Ciclo 2, sessao="tcp-s1", ultimo_comando=1 + \n)
+    Cli-->>Ctrl: Entrega snapshot do Ciclo 2
+    Ctrl->>Ctrl: GestorComandos preserva sessao="tcp-s1", confirma id=1 e emite id=2!
+```
+
+---
+
 ## 6. Guia de Fork, Branches e Fluxo de Trabalho por Etapa
 
 Conforme a Seção 7 do PDF e o workflow `.github/workflows/testes.yml`:
