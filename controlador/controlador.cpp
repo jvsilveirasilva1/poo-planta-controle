@@ -6,8 +6,41 @@
 
 #include "aquisicao.hpp"
 #include "telemetria.hpp"
+#include "vendor/nlohmann/json.hpp"
 
 namespace fermentador {
+
+namespace {
+
+std::string lerModoOperador(const std::filesystem::path& caminho_operador) {
+    if (!std::filesystem::exists(caminho_operador)) {
+        return "normal";
+    }
+    try {
+        const std::string texto = EmissorTelemetria::lerArquivoTexto(caminho_operador);
+        const auto doc = nlohmann::json::parse(texto);
+        if (!doc.is_object()) {
+            return "normal";
+        }
+        if (!doc.contains("versao") || !doc["versao"].is_number_integer() ||
+            doc["versao"].is_boolean() || doc["versao"].get<int>() != 1) {
+            return "normal";
+        }
+        if (!doc.contains("modo") || !doc["modo"].is_string()) {
+            return "normal";
+        }
+        const std::string modo = doc["modo"].get<std::string>();
+        if (modo == "falha_bomba" || modo == "sobrecarga_termica" ||
+            modo == "pausar_comandos" || modo == "normal") {
+            return modo;
+        }
+    } catch (...) {
+        // Arquivo de operador malformado é ignorado com segurança
+    }
+    return "normal";
+}
+
+}  // namespace
 
 Controlador::Controlador(std::unique_ptr<IPoliticaControle> politica,
                          AvaliadorAlarmes avaliador_alarmes,
@@ -42,6 +75,7 @@ int Controlador::processarTextoAquisicao(const std::string& texto_planta,
     const auto caminho_comando = dir_dados / "comando_planta.json";
     const auto caminho_telemetria = dir_dados / "telemetria.json";
     const auto caminho_estado = dir_dados / "controlador_estado.json";
+    const auto caminho_operador = dir_dados / "operador_comando.json";
 
     const AquisicaoPlanta aquisicao = ValidadorAquisicao::validarJsonTexto(texto_planta);
 
@@ -54,17 +88,26 @@ int Controlador::processarTextoAquisicao(const std::string& texto_planta,
     }
 
     if (ciclo_inedito) {
-        const DecisaoAtuacao decisao = politica_->calcular(aquisicao);
-        const ComandoAtuacao comando = gestor_comandos_.emitirComando(aquisicao, decisao);
-        const std::string json_cmd = comando.paraJson();
-
-        if (cliente_tcp != nullptr) {
-            if (!cliente_tcp->enviarComandoPlanta(json_cmd)) {
-                throw std::runtime_error("falha ao enviar comando de atuacao via TCP");
+        const std::string modo_operador = lerModoOperador(caminho_operador);
+        if (modo_operador != "pausar_comandos") {
+            DecisaoAtuacao decisao = politica_->calcular(aquisicao);
+            if (modo_operador == "falha_bomba") {
+                decisao = DecisaoAtuacao{0.0, 0.0};
+            } else if (modo_operador == "sobrecarga_termica") {
+                decisao = DecisaoAtuacao{100.0, 100.0};
             }
+
+            const ComandoAtuacao comando = gestor_comandos_.emitirComando(aquisicao, decisao);
+            const std::string json_cmd = comando.paraJson();
+
+            if (cliente_tcp != nullptr) {
+                if (!cliente_tcp->enviarComandoPlanta(json_cmd)) {
+                    throw std::runtime_error("falha ao enviar comando de atuacao via TCP");
+                }
+            }
+            EmissorTelemetria::gravarArquivoAtomico(caminho_comando, json_cmd);
+            gestor_comandos_.salvarEstado(caminho_estado);
         }
-        EmissorTelemetria::gravarArquivoAtomico(caminho_comando, json_cmd);
-        gestor_comandos_.salvarEstado(caminho_estado);
     }
 
     const bool obsoleta = ValidadorAquisicao::estaObsoleta(

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 
 import streamlit as st
 
@@ -16,6 +18,48 @@ from supervisor.repositorio import RepositorioTelemetria, ValidadorTelemetria
 
 
 LIMITE_OBSOLESCENCIA_SEG = 10.0
+
+
+def gravar_comando_operador(dados_dir: Path, modo: str) -> None:
+    """
+    Grava atomicamente a solicitação de simulação/operador em dados/operador_comando.json.
+    O Supervisório nunca escreve na entrada da planta (comando_planta.json);
+    toda solicitação passa pela validação e decisão do Controlador C++.
+    """
+    modos_validos = {"normal", "falha_bomba", "sobrecarga_termica", "pausar_comandos"}
+    if modo not in modos_validos:
+        raise ValueError(f"Modo de operador invalido: {modo}")
+
+    dados_dir = Path(dados_dir)
+    dados_dir.mkdir(parents=True, exist_ok=True)
+    destino = dados_dir / "operador_comando.json"
+    conteudo = json.dumps({"versao": 1, "modo": modo}, ensure_ascii=False) + "\n"
+
+    temporario = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=dados_dir,
+            prefix=f".{destino.name}.", suffix=".tmp", delete=False,
+        ) as arq:
+            temporario = Path(arq.name)
+            arq.write(conteudo)
+        os.replace(temporario, destino)
+    finally:
+        if temporario is not None:
+            temporario.unlink(missing_ok=True)
+
+
+def ler_modo_operador_atual(dados_dir: Path) -> str:
+    caminho = Path(dados_dir) / "operador_comando.json"
+    if not caminho.exists():
+        return "normal"
+    try:
+        doc = json.loads(caminho.read_text(encoding="utf-8"))
+        if isinstance(doc, dict) and doc.get("versao") == 1 and isinstance(doc.get("modo"), str):
+            return doc["modo"]
+    except Exception:
+        pass
+    return "normal"
 
 
 def renderizar_historico(repositorio: RepositorioTelemetria, sessao_filtro: str | None = None) -> None:
@@ -47,8 +91,21 @@ def renderizar_historico(repositorio: RepositorioTelemetria, sessao_filtro: str 
     )
 
 
-def _desenhar_painel(dados_dir: Path, caminho_telemetria: Path, caminho_banco: Path) -> None:
+def _desenhar_painel(
+    dados_dir: Path,
+    caminho_telemetria: Path,
+    caminho_banco: Path,
+    simular_erro_tela: bool = False,
+) -> None:
     repositorio = RepositorioTelemetria(caminho_banco)
+
+    if simular_erro_tela:
+        st.error(
+            "Falha simulada na interface: documento de telemetria corrompido (JSON inválido). "
+            "O histórico persistido no SQLite foi preservado."
+        )
+        renderizar_historico(repositorio)
+        return
 
     try:
         telemetria = ValidadorTelemetria.carregar_arquivo(caminho_telemetria)
@@ -121,14 +178,52 @@ def _desenhar_painel(dados_dir: Path, caminho_telemetria: Path, caminho_banco: P
 
 
 @st.fragment(run_every=1.0)
-def _painel_auto_atualizado(dados_dir: Path, caminho_telemetria: Path, caminho_banco: Path) -> None:
-    _desenhar_painel(dados_dir, caminho_telemetria, caminho_banco)
+def _painel_auto_atualizado(
+    dados_dir: Path,
+    caminho_telemetria: Path,
+    caminho_banco: Path,
+    simular_erro_tela: bool = False,
+) -> None:
+    _desenhar_painel(dados_dir, caminho_telemetria, caminho_banco, simular_erro_tela)
+
+
+def _renderizar_barra_simulacao(dados_dir: Path) -> bool:
+    with st.sidebar:
+        st.header("Simulação de Falhas e Alarmes")
+        st.caption(
+            "Os comandos são enviados ao Controlador C++ via `operador_comando.json` "
+            "(preservando o único escritor de cada arquivo)."
+        )
+        modo_atual = ler_modo_operador_atual(dados_dir)
+        st.info(f"Modo atual do controlador: **{modo_atual}**")
+
+        if st.button("Restaurar Controle Automático", width="stretch", type="primary"):
+            gravar_comando_operador(dados_dir, "normal")
+            st.rerun()
+
+        if st.button("Simular Falha na Bomba (NIVEL_BAIXO)", width="stretch"):
+            gravar_comando_operador(dados_dir, "falha_bomba")
+            st.rerun()
+
+        if st.button("Simular Sobrecarga (TEMP_ALTA / NIVEL_ALTO)", width="stretch"):
+            gravar_comando_operador(dados_dir, "sobrecarga_termica")
+            st.rerun()
+
+        if st.button("Simular Queda de Comando (Watchdog 5 ciclos)", width="stretch"):
+            gravar_comando_operador(dados_dir, "pausar_comandos")
+            st.rerun()
+
+        st.divider()
+        simular_erro_tela = st.toggle("Simular JSON inválido na tela", value=False)
+    return simular_erro_tela
 
 
 def main() -> None:
     dados_dir = Path(os.environ.get("POO_DADOS", "dados"))
     caminho_telemetria = dados_dir / "telemetria.json"
     caminho_banco = dados_dir / "historico.sqlite"
+
+    simular_erro_tela = _renderizar_barra_simulacao(dados_dir)
 
     st.title("Supervisório — Fermentador Cervejeiro Automatizado")
     col_cab1, col_cab2 = st.columns([3, 1])
@@ -138,9 +233,9 @@ def main() -> None:
         auto_atualizar = st.toggle("Atualização automática (1s)", value=True)
 
     if auto_atualizar:
-        _painel_auto_atualizado(dados_dir, caminho_telemetria, caminho_banco)
+        _painel_auto_atualizado(dados_dir, caminho_telemetria, caminho_banco, simular_erro_tela)
     else:
-        _desenhar_painel(dados_dir, caminho_telemetria, caminho_banco)
+        _desenhar_painel(dados_dir, caminho_telemetria, caminho_banco, simular_erro_tela)
 
 
 if __name__ == "__main__":

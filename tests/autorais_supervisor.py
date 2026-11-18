@@ -255,5 +255,18 @@ class TestBonusTcpIntegracao(unittest.TestCase):
             self.assertEqual(tel_tcp["sessao"], "sessao-tcp-bonus")
 
 
+class TestSimulacaoFalhaOperador(unittest.TestCase):
+    def test_gravar_comando_operador_e_rejeitar_modo_invalido(self):
+        from supervisor.app import gravar_comando_operador, ler_modo_operador_atual
+
+        with tempfile.TemporaryDirectory() as diretorio:
+            dados = Path(diretorio)
+            self.assertEqual(ler_modo_operador_atual(dados), "normal")
+            gravar_comando_operador(dados, "sobrecarga_termica")
+            self.assertEqual(ler_modo_operador_atual(dados), "sobrecarga_termica")
+            with self.assertRaises(ValueError):
+                gravar_comando_operador(dados, "modo_inexistente")
+
+
 if __name__ == "__main__":
     unittest.main()
