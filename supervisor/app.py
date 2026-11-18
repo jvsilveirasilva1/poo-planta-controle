@@ -47,14 +47,7 @@ def renderizar_historico(repositorio: RepositorioTelemetria, sessao_filtro: str 
     )
 
 
-def main() -> None:
-    dados_dir = Path(os.environ.get("POO_DADOS", "dados"))
-    caminho_telemetria = dados_dir / "telemetria.json"
-    caminho_banco = dados_dir / "historico.sqlite"
-
-    st.title("Supervisório — Fermentador Cervejeiro Automatizado")
-    st.caption(f"Diretório de integração: {dados_dir} | Fonte: {caminho_telemetria.name}")
-
+def _desenhar_painel(dados_dir: Path, caminho_telemetria: Path, caminho_banco: Path) -> None:
     repositorio = RepositorioTelemetria(caminho_banco)
 
     try:
@@ -125,6 +118,29 @@ def main() -> None:
     )
 
     renderizar_historico(repositorio, sessao_filtro=telemetria["sessao"])
+
+
+@st.fragment(run_every=1.0)
+def _painel_auto_atualizado(dados_dir: Path, caminho_telemetria: Path, caminho_banco: Path) -> None:
+    _desenhar_painel(dados_dir, caminho_telemetria, caminho_banco)
+
+
+def main() -> None:
+    dados_dir = Path(os.environ.get("POO_DADOS", "dados"))
+    caminho_telemetria = dados_dir / "telemetria.json"
+    caminho_banco = dados_dir / "historico.sqlite"
+
+    st.title("Supervisório — Fermentador Cervejeiro Automatizado")
+    col_cab1, col_cab2 = st.columns([3, 1])
+    with col_cab1:
+        st.caption(f"Diretório de integração: {dados_dir} | Fonte: {caminho_telemetria.name}")
+    with col_cab2:
+        auto_atualizar = st.toggle("Atualização automática (1s)", value=True)
+
+    if auto_atualizar:
+        _painel_auto_atualizado(dados_dir, caminho_telemetria, caminho_banco)
+    else:
+        _desenhar_painel(dados_dir, caminho_telemetria, caminho_banco)
 
 
 if __name__ == "__main__":
