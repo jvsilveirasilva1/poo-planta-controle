@@ -40,7 +40,7 @@ def renderizar_historico(repositorio: RepositorioTelemetria, sessao_filtro: str 
 
     csv_conteudo = repositorio.exportar_csv(sessao=sessao_filtro)
     st.download_button(
-        label="Exportar Histórico Consultihado (CSV)",
+        label="Exportar Histórico Consultado (CSV)",
         data=csv_conteudo,
         file_name="historico_fermentador.csv",
         mime="text/csv",
