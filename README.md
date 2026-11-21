@@ -252,14 +252,16 @@ Os relatórios detalhados de linhas e ramificações ficam disponíveis em:
 
 ## 7. Divisão de Trabalho e Limitações Conhecidas
 
-- **Fork Oficial de Entrega**: `https://github.com/rcristelojr20/poo-planta-controle`
+- **Forks da Dupla e Reunião das Contribuições**:
+  - **Fork com Pipeline de PRs e CI Completa**: `https://github.com/jvsilveirasilva1/poo-planta-controle` (integração sequencial das 5 PRs incrementais `projeto/00-ambiente` → `projeto/04-entrega` com CI verde e artefatos de cobertura).
+  - **Fork do Colega**: `https://github.com/rcristelojr20/poo-planta-controle` (preservando autoria de `@rcristelojr20` nas etapas 00–04 com coautoria de `@jvsilveirasilva1` e commits exclusivos de `@jvsilveirasilva1` nas melhorias finais do supervisório, painel de simulação via `operador_comando.json` e documentação `docs/METRICAS_STREAMLIT.md`).
 - **Integrantes da Dupla**:
-  - **`@rcristelojr20`** (Autor principal nos commits do fork de entrega)
-  - **`@jvsilveirasilva1`** (Coautor registrado via `Co-authored-by` e revisor das PRs)
+  - **`@rcristelojr20`** (Autor principal dos commits das etapas 00 a 04 e do Bônus TCP)
+  - **`@jvsilveirasilva1`** (Coautor, autor dos commits finais de auto-refresh, simulação de falhas e `docs/METRICAS_STREAMLIT.md`, e responsável pela integração das PRs na `main`)
 - **Divisão das Entregas**:
-  - **Arquitetura e Documentação (`docs/ARQUITETURA_E_DECISOES.md`, UML e Contratos)**: Planejamento conjunto da dupla.
+  - **Arquitetura e Documentação (`docs/ARQUITETURA_E_DECISOES.md`, `docs/METRICAS_STREAMLIT.md`, UML e Contratos)**: Planejamento e documentação pela dupla.
   - **Controlador C++ (`aquisicao`, `alarmes`, `telemetria`, `politicas`, `comando`, `controlador`, `transporte_tcp`) e Testes C++**: Implementação e verificação unitária em C++17.
-  - **Supervisório Python (`supervisor/repositorio.py`, `supervisor/app.py`, `supervisor/transporte_tcp.py`) e Testes Python**: Implementação do padrão `Repository` em SQLite, interface Streamlit, servidor/cliente TCP e testes de integração fim-a-fim.
+  - **Supervisório Python (`supervisor/repositorio.py`, `supervisor/app.py`, `supervisor/transporte_tcp.py`) e Testes Python**: Implementação do padrão `Repository` em SQLite, interface Streamlit com auto-refresh (1s) e painel de simulação via `operador_comando.json`, servidor/cliente TCP e testes de integração fim-a-fim.
 - **Limitações Conhecidas**:
   - A troca de dados por snapshots JSON substitui o estado mais recente a cada ciclo; caso o consumidor seja mais lento que o produtor, ciclos intermediários podem não ser observados (o histórico SQLite registra fielmente todos os ciclos observados sem prometê-los sem perdas).
   - A escrita atômica via arquivo temporário e renomeação (`rename` / `os.replace`) garante documentos completos no mesmo sistema de arquivos local, mas não constitui transação distribuída.
