@@ -1,294 +1,244 @@
-# Planta, controlador e supervisório — starter de POO
+# Projeto Final POO — Fermentador Cervejeiro: Planta, Controlador C++ e Supervisório
 
-Repositório-base público: `rafaelrezo/poo-planta-controle`.
-Faça fork para desenvolver seu projeto. A planta de tanque é fornecida pronta;
-o controlador C++ e o Streamlit são esqueletos executáveis com comportamento
-incompleto identificado. A planta também pode ser usada isoladamente em aulas
-de arquivos, JSON, validação e tratamento de erros.
+Sistema integrado de automação local composto por **três processos independentes** que se comunicam por snapshots JSON atômicos em `dados/`:
+1. **Planta Simulada (`planta/simulador.py` — Python)**: Simula a dinâmica termo-hidráulica de uma dorna de fermentação cervejeira (nível de mosto `LT-01` em `%` e temperatura de fermentação `TT-01` em `°C`), respondendo aos atuadores `bomba` e `aquecedor`.
+2. **Controlador Automático (`controlador/` — C++17)**: Adquire e valida `dados/planta.json`, aplica a política de controle polimórfica (**Padrão Strategy**: `PoliticaHisterese` ou `PoliticaProporcional`), gerencia o ciclo de vida das solicitações de atuação (**Padrão Command**: emissão única por ciclo, confirmação de ID e detecção de expiração) e publica `dados/comando_planta.json` e `dados/telemetria.json`.
+3. **Supervisório (`supervisor/` — Python/Streamlit + SQLite)**: Valida a telemetria e diagnostica obsolescência do snapshot, persiste o histórico sem duplicação em SQLite (**Padrão Repository** com chave primária composta `(sessao, ciclo)`), apresenta leituras, atuação observada, confirmação, alarmes e gráficos temporais, e exporta os dados consultados em CSV.
 
-Você começará executando a planta pronta, verá o arquivo criado e só depois
-desenvolverá os outros programas. Execute os comandos no terminal, na pasta
-que contém este README e o `Makefile`. Não é necessário usar Streamlit para
-começar a gerar ou ler os dados.
+> Consulte o estudo arquitetural completo, trade-offs e diagramas adicionais em [`docs/ARQUITETURA_E_DECISOES.md`](docs/ARQUITETURA_E_DECISOES.md) e a especificação do protocolo em [`docs/CONTRATO.md`](docs/CONTRATO.md).
 
-```text
-Planta pronta -> planta.json -> seu controlador C++ -> telemetria.json -> sua tela
-     ^                                  |
-     +---------- comando_planta.json ----+
-```
+---
 
-## 1. O que já funciona
+## 1. Cenário, Grandezas, Atuadores, Parâmetros e Limites do Modelo
 
-| Parte | Estado inicial | Responsabilidade |
-|---|---|---|
-| `planta/simulador.py` | pronta, testada, biblioteca padrão Python | gerar leituras e aplicar comandos |
-| `controlador/main.cpp` | compila e informa que está incompleto | aquisição e controle a desenvolver |
-| `supervisor/app.py` | abre uma página inicial | supervisão a desenvolver |
-| `tools/enviar_comando.py` | pronto | teste manual de atuação, sem política automática |
-| `docs/CONTRATO.md` | fornecido | formato, autoria dos arquivos e regras de troca |
+| Elemento | Identificador no Contrato | Faixa / Parâmetros Configurados | Papel no Processo de Fermentação |
+|---|---|---|---|
+| **Nível de Mosto** | Tag `LT-01` · `tipo: "nivel"` · `unidade: "%"` | Faixa física: `[0.0%, 100.0%]` (Inicial: `50.0%`)<br>Banda de Histerese: **`[55.0%, 65.0%]`**<br>Setpoint Proporcional: **`60.0%`** ($K_p = 4.0$) | Garante volume útil na dorna preservando `35%` de *headspace* para espuma. |
+| **Temperatura de Fermentação** | Tag `TT-01` · `tipo: "temperatura"` · `unidade: "C"` | Faixa física: `[0.0 C, 100.0 C]` (Inicial: `25.0 C`)<br>Banda de Histerese: **`[33.0 C, 37.0 C]`**<br>Setpoint Proporcional: **`35.0 C`** ($K_p = 8.0$) | Mantém a levedura (*Kveik / Ale*) na faixa metabólica ativa. |
+| **Bomba de Mosto** | Atuador `bomba` (`0.0%` a `100.0%`) | Equilíbrio físico na planta: **`33.33%`** ($\Delta \text{nivel} = 0$) | Compensa a extração contínua de `-1.0%/ciclo` da planta. |
+| **Camisa Térmica** | Atuador `aquecedor` (`0.0%` a `100.0%`) | Equilíbrio físico a `35 C`: **`40.00%`** ($\Delta \text{temp} = 0$) | Compensa a perda térmica natural de `4%` em direção ao ambiente (`20 C`). |
+| **Alarmes de Nível** | `NIVEL_BAIXO` (`aviso`) / `NIVEL_ALTO` (`critico`) | Fronteiras explícitas: `< 25.0%` e `> 85.0%` | Previne cavitação da bomba (`< 25%`) e transbordo/*blow-off* (`> 85%`). |
+| **Alarmes de Temperatura** | `TEMP_BAIXA` (`aviso`) / `TEMP_ALTA` (`critico`) | Fronteiras explícitas: `< 22.0 C` e `> 45.0 C` | Previne dormência (`< 22 C`) e morte térmica da levedura (`> 45 C`). |
+| **Obsolescência e Watchdog** | `AQUISICAO_OBSOLETA` / `timeout_comando` | Idade máxima: **`10 segundos`**<br>Watchdog da planta: **`5 ciclos`** sem comando novo | Detecta parada de processos e leva atuadores a `0%` por segurança. |
 
-Não há algoritmo automático de controle fornecido. Tanque, nível e temperatura
-são um ponto de partida; outro contexto pode ser escolhido e documentado.
-O enunciado e os critérios de avaliação são distribuídos separadamente pelo docente.
+---
 
-## 2. Fork e requisitos
+## 2. Dependências e Ambiente Limpo
 
-Use Python 3.12+, compilador C++17 e GNU Make (Linux, WSL ou ambiente equivalente).
-Primeiro faça fork pela interface do GitHub. Substitua `SEU_USUARIO` abaixo:
+- **C++17**: `g++` (GCC 11+), `gcov` e `GNU Make`.
+  - Biblioteca JSON C++: **JSON for Modern C++ (`nlohmann/json.hpp` v3.11.3)** incluída diretamente como cabeçalho único em `controlador/vendor/nlohmann/json.hpp` (sem necessidade de instalação externa e isolada da medição de cobertura autoral).
+- **Python 3.12+**: Biblioteca padrão (`sqlite3`, `json`, `unittest`, `csv`) para planta e repositório; ambiente virtual `.venv` com `requirements-dev.txt` (`streamlit`, `coverage`, `gcovr`) para tela e relatórios de cobertura.
 
-```bash
-git clone https://github.com/SEU_USUARIO/poo-planta-controle.git
-cd poo-planta-controle
-git remote -v
-git switch -c projeto/00-ambiente
-make test ETAPA=00
-```
-
-Mantenha somente `origin`, apontando para seu fork. Abra todas as PRs da branch
-para a `main` do próprio fork. Não adicione `upstream` nem abra PR contra a base
-do professor. Preserve os commits iniciais e acrescente o trabalho da equipe.
-
-O comando compila o C++ com avisos tratados como erros e roda os testes da planta.
-Resultado esperado: `OK`. A etapa 00 confirma a infraestrutura, não o projeto pronto.
-Se aparecer `command not found`, confira se Python, g++ e Make estão instalados
-no terminal Linux/WSL que você está usando. `git remote -v` deve mostrar somente
-`origin`, com o endereço do seu fork nas linhas de leitura e escrita.
-
-## 3. Experimentar arquivos antes de implementar o controle
-
-### 3.1. Gerar uma primeira aquisição
-
-Na raiz do fork, execute este comando. Ele cria a pasta `dados` automaticamente,
-simula três ciclos e encerra; você não precisa interrompê-lo:
-
-```bash
-python3 -m planta.simulador --dados dados --passos 3 --intervalo 0 --seed 7
-```
-
-| Parte do comando | O que você está pedindo |
-|---|---|
-| `--dados dados` | salvar os arquivos na pasta `dados` |
-| `--passos 3` | executar três ciclos e encerrar |
-| `--intervalo 0` | executar sem esperar entre os ciclos |
-| `--seed 7` | repetir os sorteios ao repetir as mesmas condições |
-
-A última linha começa com `ciclo=3`. Agora leia os dados gerados:
-
-```bash
-python3 tools/inspecionar.py --dados dados
-```
-
-Em uma execução inicial com esses parâmetros e sem comandos de atuação, a saída é:
-
-```text
-Ciclo: 3
-LT-01: 47.004 %
-TT-01: 24.25 C
-Comando confirmado: 0
-```
-
-`LT-01` identifica o nível e `TT-01`, a temperatura. O zero indica que nenhum
-comando foi aceito nesta sessão. A semente fixa reproduz as medições; o instante
-e a identificação da sessão mudam. Para ver a estrutura completa do arquivo:
-
-```bash
-python3 -m json.tool dados/planta.json
-```
-
-| Campo que você verá | Como usá-lo |
-|---|---|
-| `sessao` e `ciclo` | saber se é uma aquisição nova ou um arquivo já processado |
-| `timestamp` | mostrar quando a aquisição ocorreu e identificar dados antigos |
-| `leituras` | obter tag, valor, unidade e estado de cada medição |
-| `atuadores` | saber a atuação que a planta realmente aplicou |
-| `ultimo_comando` | conferir qual solicitação já foi aceita |
-
-O arquivo é um **snapshot**, uma fotografia do estado mais recente. Cada ciclo
-substitui o conteúdo anterior; três ciclos não significam três documentos no
-arquivo. O histórico será uma responsabilidade do projeto, em outro armazenamento.
-
-**Confira antes de continuar:** você consegue localizar o valor do nível e sua
-unidade no JSON, e explicar por que o arquivo termina no ciclo 3?
-
-### 3.2. Entender como seu código utilizará esses dados
-
-O controlador C++ deverá abrir `dados/planta.json`, validar seus campos e
-representar as medições nos objetos que você criar. Depois, sua política decidirá
-a atuação e publicará o comando. A telemetria validada será a entrada do Streamlit.
-O controlador recebe medições da planta; ele não precisa sorteá-las novamente.
-
-Execute o esqueleto atual:
-
-```bash
-make controlador
-```
-
-Ele mostra `CONTROLADOR INCOMPLETO`. Isso é esperado: ainda não lê a aquisição,
-não publica `telemetria.json` e não controla a planta. O teste da etapa 01
-mostrará o primeiro comportamento que falta implementar. O programa de inspeção
-fornecido serve para entender o arquivo; a aquisição em C++ é trabalho da equipe.
-
-### 3.3. Ver uma atuação mudar a planta
-
-Para observar atuação, execute a planta continuamente em um terminal:
-
-```bash
-make planta
-```
-
-Em outro terminal, na mesma raiz, envie um comando manual e inspecione o arquivo
-depois do próximo ciclo. Aguarde cerca de um segundo entre o envio e a inspeção:
-
-```bash
-python3 tools/enviar_comando.py --dados dados --bomba 100 --aquecedor 50
-python3 tools/inspecionar.py --dados dados
-```
-
-Confirme `ultimo_comando` e as novas atuações. Sem comandos novos, a atuação
-expira após 5 ciclos. Não execute o comissionador e o controlador automático
-simultaneamente: o arquivo de comando deve ter um único escritor. A planta pode
-ser encerrada com Ctrl+C. Cada reinício gera outra sessão e invalida comandos antigos.
-
-**O que observar:** a ferramenta informa o id enviado. Depois, `Comando confirmado`
-mostra esse id e o nível passa a subir enquanto a bomba está atuando. Se esperar
-sem enviar um id novo, a planta zera os atuadores após cinco ciclos. Isso ajuda a
-distinguir pedido escrito, pedido aceito e atuação expirada.
-
-## 4. Abrir o esqueleto Streamlit
+### Preparação Reproduzível em Ambiente Limpo (Linux / WSL)
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
+make build
+```
+
+---
+
+## 3. Como Compilar e Executar os Três Processos Separados
+
+Abra **três terminais independentes** na raiz do repositório:
+
+### Terminal 1 — Planta Simulada (Python)
+```bash
+make planta
+# Ou com parâmetros customizados:
+python3 -m planta.simulador --dados dados --intervalo 1 --seed 7
+```
+
+### Terminal 2 — Controlador Automático (C++)
+```bash
+# Execução de um único ciclo (usada em scripts e testes):
+./build/controlador --dados dados --uma-vez
+
+# Execução contínua com a política padrão (Histerese):
+./build/controlador --dados dados --politica histerese
+
+# Execução contínua com a segunda política (Proporcional):
+./build/controlador --dados dados --politica proporcional
+```
+
+### Terminal 3 — Supervisório (Python / Streamlit + SQLite)
+```bash
 make supervisor PYTHON=.venv/bin/python
 ```
 
-A página inicial tem título, diretório e aviso de implementação incompleta.
-A equipe desenvolverá a leitura de `telemetria.json`, sem acesso direto à planta.
-A variável `POO_DADOS` pode escolher outro diretório para testes e demonstração.
-`requirements-dev.txt` instala também as ferramentas de cobertura; a planta
-isolada usa apenas a biblioteca padrão. Ao terminar de observar a página,
-encerre o comando de Streamlit com Ctrl+C no terminal onde o iniciou.
+---
 
-## 5. Incrementos e testes cumulativos
+## 4. Diagrama de Classes UML e Padrões de Projeto
 
-Integre cada PR antes de abrir a branch seguinte. Parta da main atualizada e
-altere `ETAPA_ATUAL` no mesmo incremento, para que a CI da main mantenha as verificações.
-`make test` sem `ETAPA` lê esse arquivo; especificar `ETAPA=01`, por exemplo,
-permite testar a próxima etapa antes de integrá-la.
+```mermaid
+classDiagram
+    direction TB
 
-| Branch | `ETAPA_ATUAL` | Comando local e da CI | Comportamento verificado |
-|---|---|---|---|
-| `projeto/00-ambiente` | `00` | `make test ETAPA=00` | planta e build inicial |
-| `projeto/01-aquisicao` | `01` | `make test ETAPA=01` | anteriores + aquisição, falhas e testes autorais C++ |
-| `projeto/02-controle` | `02` | `make test ETAPA=02` | anteriores + comando e confirmação da planta |
-| `projeto/03-supervisor` | `03` | `make test ETAPA=03` | anteriores + tela e testes autorais Python |
-| `projeto/04-entrega` | `03` | `make test ETAPA=03` | regressão completa e casos autorais |
+    class LeituraSensor {
+        -string tag_
+        -string tipo_
+        -double valor_
+        -string unidade_
+        -string status_
+        +atualizarValor(novo_valor: double) void
+        +tag() string
+        +tipo() string
+        +valor() double
+        +unidade() string
+        +status() string
+    }
 
-Na etapa 03, instale `requirements-dev.txt` e use
-`make test ETAPA=03 PYTHON=.venv/bin/python`; o ambiente ativo da CI já tem as
-dependências. `AppTest` verifica a tela sem iniciar servidor nem navegador.
+    class AquisicaoPlanta {
+        -int versao_
+        -string sessao_
+        -int ciclo_
+        -string timestamp_
+        -vector~LeituraSensor~ leituras_
+        -double bomba_aplicada_
+        -double aquecedor_aplicado_
+        -int ultimo_comando_
+        -optional~string~ erro_comando_
+        -optional~string~ motivo_seguro_
+        +nivel() double
+        +temperatura() double
+    }
 
-As etapas 01–03 falham inicialmente porque o aluno ainda não implementou os
-comportamentos. A mensagem `Falta telemetria.json` orienta a primeira aquisição.
-O controlador deve aceitar `--dados DIRETORIO --uma-vez`; `--uma-vez` processa uma
-aquisição e encerra. A equipe também implementa o laço contínuo para a demonstração.
+    class ValidadorAquisicao {
+        +validarJsonTexto(texto_json: string)$ AquisicaoPlanta
+        +estaObsoleta(timestamp_utc: string, agora_utc: time_t, limite_seg: int)$ bool
+    }
 
-Fluxo de uma etapa, após integrar a anterior:
+    class IPoliticaControle {
+        <<interface>>
+        +calcular(aquisicao: AquisicaoPlanta)* DecisaoAtuacao
+        +nome()* string
+    }
 
-```bash
-git switch main
-git pull --ff-only origin main
-git switch -c projeto/01-aquisicao
-make test ETAPA=01
+    class PoliticaHisterese {
+        -double nivel_min_
+        -double nivel_max_
+        -double temp_min_
+        -double temp_max_
+        -double estado_bomba_
+        -double estado_aquecedor_
+        +calcular(aquisicao: AquisicaoPlanta) DecisaoAtuacao
+        +definirEstado(bomba: double, aquecedor: double) void
+        +nome() string
+    }
+
+    class PoliticaProporcional {
+        -double setpoint_nivel_
+        -double setpoint_temp_
+        -double kp_nivel_
+        -double kp_temp_
+        -double bias_bomba_
+        -double bias_aquecedor_
+        +calcular(aquisicao: AquisicaoPlanta) DecisaoAtuacao
+        +nome() string
+    }
+
+    class ComandoAtuacao {
+        -int versao_
+        -string sessao_
+        -int id_
+        -double bomba_
+        -double aquecedor_
+        +paraJson() string
+    }
+
+    class GestorComandos {
+        -string sessao_atual_
+        -int ultimo_ciclo_processado_
+        -int ultimo_id_emitido_
+        -int ultimo_id_confirmado_
+        -bool ultimo_comando_confirmado_
+        -bool comando_expirado_
+        +reconciliarCiclo(aquisicao: AquisicaoPlanta) bool
+        +emitirComando(aquisicao: AquisicaoPlanta, decisao: DecisaoAtuacao) ComandoAtuacao
+    }
+
+    class AvaliadorAlarmes {
+        -double nivel_baixo_
+        -double nivel_alto_
+        -double temp_baixa_
+        -double temp_alta_
+        +avaliar(aquisicao: AquisicaoPlanta, obsoleta: bool) vector~Alarme~
+    }
+
+    class Controlador {
+        -unique_ptr~IPoliticaControle~ politica_
+        -GestorComandos gestor_comandos_
+        -AvaliadorAlarmes avaliador_alarmes_
+        +trocarPolitica(nova_politica: unique_ptr~IPoliticaControle~) void
+        +processarCiclo(dir_dados: path, agora_utc: time_t) int
+    }
+
+    class RepositorioTelemetria {
+        -Path caminho_banco
+        +registrar_telemetria(documento: dict) bool
+        +listar_historico(sessao: str, limite: int) list~dict~
+        +exportar_csv(sessao: str, limite: int) str
+    }
+
+    AquisicaoPlanta *-- LeituraSensor
+    IPoliticaControle <|.. PoliticaHisterese : Strategy (Principal)
+    IPoliticaControle <|.. PoliticaProporcional : Strategy (Alternativa)
+    GestorComandos ..> ComandoAtuacao : Command
+    Controlador *-- IPoliticaControle
+    Controlador *-- GestorComandos
+    Controlador *-- AvaliadorAlarmes
+    Controlador ..> ValidadorAquisicao
 ```
 
-Depois de implementar, atualizar `ETAPA_ATUAL` e validar, faça commits pequenos,
-push para `origin` e abra a PR. A PR inclui saída local, link da CI do commit,
-explicação técnica, UML quando mudar e registro do uso de IA.
+### Resumo dos Padrões Aplicados
+1. **`Strategy` (`IPoliticaControle`, `PoliticaHisterese`, `PoliticaProporcional`)**:
+   - **Problema**: Variar a lei matemática de controle (banda morta com memória vs. ação contínua proporcional ao erro) sem acoplar cálculos e estados ao orquestrador de arquivos.
+   - **Alternativa mais simples**: Condicional `if/else` dentro de `Controlador`, descartada por misturar estados de histerese e ganhos proporcionais na mesma classe.
+2. **`Command` (`ComandoAtuacao`, `GestorComandos`)**:
+   - **Problema**: Rastrear identidade (`id` crescente por `sessao`), garantir idempotência ao reler o mesmo ciclo (inclusive entre execuções `--uma-vez` via `dados/controlador_estado.json`) e reconciliar confirmação (`ultimo_comando`) e expiração (`comando_expirado`).
+   - **Alternativa mais simples**: Gravar JSON diretamente a partir de `double`, descartada por não preservar rastreio entre ciclos.
+3. **`Repository` (`RepositorioTelemetria` em Python/SQLite)**:
+   - **Problema**: Persistir histórico deduplicado por `(sessao, ciclo)` e exportar CSV sem acoplar consultas SQL ao ciclo de *rerun* da interface Streamlit.
+   - **Alternativa mais simples**: Queries SQLite diretas em `supervisor/app.py`, descartadas por impedir testes unitários isolados sem UI.
 
-## 6. Testes que a equipe acrescenta
+---
 
-Cada objeto que você criar precisa de testes que mostrem seu comportamento.
-Os contratos fornecidos não substituem os testes das suas classes e políticas.
-Para cada responsabilidade, escolha um caso comum, uma fronteira e uma falha
-quando aplicáveis. Verifique resultado e estado preservado; não apenas que o código executa.
+## 5. Matriz de Testes Autorais (Comum, Fronteira, Falha e Lacunas Conhecidas)
 
-| Código da equipe | Onde escrever os testes | Como serão executados |
-|---|---|---|
-| classes C++ em `controlador/` | `tests/cpp/autorais_*.cpp`, com um `main` por arquivo | o Makefile compila e o runner executa os binários |
-| objetos Python do supervisor/persistência | `tests/autorais_*.py`, usando `unittest` | o runner descobre e executa os casos |
+| Objeto / Método | Requisito Verificado | Caso de Teste e Entrada | Resultado Esperado e Estado Preservado | Arquivo de Teste | Lacuna Conhecida / Justificativa |
+|---|---|---|---|---|---|
+| `LeituraSensor` / construtor e `atualizarValor` | Requisito 2 e 6 (aquisição de 2 grandezas e recusa de leitura inválida) | **Comum**: `60.0%`<br>**Fronteira**: `0.0%` e `100.0%`<br>**Falha**: `-0.01`, `100.01`, `NaN`, unidade trocada, `status="falha"` | Aceita `[0, 100]`; lança `std::invalid_argument` fora da faixa e **preserva o valor `100.0` anterior**. | `tests/cpp/autorais_aquisicao.cpp` | Não modela sensores extras além de nível e temperatura, pois o contrato fixa 2 grandezas. |
+| `ValidadorAquisicao` / `validarJsonTexto` e `estaObsoleta` | Requisito 5 e 6 (validar `planta.json`, tipos estritos e dados antigos) | **Comum**: JSON válido ciclo 4<br>**Fronteira**: idade `== 5s` vs `6s` (limite `5s`)<br>**Falha**: `versao: true`, JSON truncado, grandeza ausente | Retorna `AquisicaoPlanta` íntegra; `estaObsoleta == false` em `5s` e `true` em `6s`; rejeita booleanos em campos inteiros. | `tests/cpp/autorais_aquisicao.cpp` | Timestamps com frações de segundo (`.123Z`) são recusados pois o contrato especifica `AAAA-MM-DDTHH:MM:SSZ`. |
+| `AvaliadorAlarmes` / `avaliar` | Requisito 7 (alarmes com regra e fronteira explícitas + obsolescência) | **Comum**: `60%`, `35C`<br>**Fronteira**: `25.0%`, `85.0%`, `22.0C`, `45.0C`<br>**Falha/Crítico**: `24.9%`, `85.1%`, `21.9C`, `45.1C`, `obsoleta=true` | Zero alarmes nas fronteiras exatas; dispara `NIVEL_BAIXO`, `NIVEL_ALTO`, `TEMP_BAIXA`, `TEMP_ALTA` e `AQUISICAO_OBSOLETA`. | `tests/cpp/autorais_aquisicao.cpp` | Severidades são fixas por regra de domínio (`aviso` ou `critico`). |
+| `PoliticaHisterese` vs `PoliticaProporcional` | Requisito 3 e 4 (duas estratégias com decisões distintas, fronteiras e estado) | **Comum**: `nivel=58%`, `temp=34C`<br>**Fronteira Histerese**: `55.0%`, `54.9%`, `65.0%`, `65.1%`<br>**Falha**: `definirEstado(-10, 50)` | Para `(58%, 34C)`: Histerese decide `(0%, 0%)` e Proporcional decide `(41.33%, 48.0%)`. Histerese preserva `100%` após tentativa inválida. | `tests/cpp/autorais_controle.cpp` | Ganhos $K_p$ são configurados na inicialização, sem auto-tuning dinâmico. |
+| `ComandoAtuacao` e `GestorComandos` | Requisito 4, 5 e 6 (padrão Command, confirmação, expiração, mesmo ciclo e nova sessão) | **Comum**: emissão ciclo 1 (`id=1`) e confirmação ciclo 2<br>**Fronteira**: releitura do ciclo 1; `comando_expirado` no ciclo 7<br>**Falha**: reinício de sessão (`sessao-B`) e `id <= 0` | Releitura do ciclo 1 retorna `false` (não renova comando); ciclo 2 confirma `id=1`; nova sessão reseta contador para `id=1`. | `tests/cpp/autorais_controle.cpp` | Persistência de estado é local em arquivo JSON, sem lock distribuído entre máquinas. |
+| `Controlador` / `processarCiclo` e `trocarPolitica` | Requisito 5 e 6 (integração C++, recuperação de arquivo inválido e troca de Strategy) | **Comum**: ciclo 1 -> `id=1`<br>**Falha**: `planta.json` corrompido no meio da operação<br>**Recuperação**: ciclo 2 válido após falha | Retorna erro `1` no JSON corrompido **preservando `telemetria.json` anterior** e retoma emissão normal (`id=2`) no ciclo 2. | `tests/cpp/autorais_controle.cpp` | Ramificações de erro de hardware de disco (`rename` falhando por permissão de SO) não ocorrem em execução normal. |
+| `ValidadorTelemetria` e `RepositorioTelemetria` | Requisito 8 e 9 (SQLite deduplicado por `sessao/ciclo`, exportação CSV e caminho E2E) | **Comum**: ciclos 1 e 2 no SQLite + exportação CSV<br>**Fronteira**: releitura/refresh da tela no mesmo `(sessao, ciclo)`<br>**Falha**: telemetria inválida após ciclo válido | `registrar_telemetria` retorna `False` na duplicata mantendo apenas 1 registro no SQLite; CSV exporta exatamente as linhas consultadas. | `tests/autorais_supervisor.py` | Consulta padrão limita-se aos últimos `200` ciclos na UI (`1000` no CSV) para manter responsividade. |
 
-O Makefile encontra arquivos `.cpp` dentro de `controlador/` e liga os objetos
-de implementação aos testes, sem incluir o `main.cpp` do aplicativo. Classes
-definidas em `.hpp` também podem ser incluídas pelos testes. Separe a lógica de
-domínio da função `main`, para testá-la sem iniciar o programa completo.
+---
 
-Desde a etapa 01, o comando exige ao menos um executável de teste autoral C++;
-na etapa 03, exige também casos autorais Python. Essa checagem confirma registro
-e execução, sem provar que todas as classes foram cobertas. A matriz de testes
-e a revisão do código complementam a automação.
-
-Comece pelo [guia de testes de objetos](docs/TESTES.md), com exemplos completos,
-saídas esperadas e um exercício de provocar e corrigir uma falha. Depois rode:
+## 6. Como Executar os Testes e Gerar Relatórios de Cobertura
 
 ```bash
+# Executar toda a suíte de testes (C++ autorais + Contratos + Python autorais + AppTest):
 make test ETAPA=03 PYTHON=.venv/bin/python
+
+# Gerar relatórios HTML de cobertura C++ (gcovr) e Python (coverage.py):
 make cobertura ETAPA=03 PYTHON=.venv/bin/python
 ```
 
-Na primeira linha, procure os nomes dos seus testes, além dos testes fornecidos.
-A segunda recompila C++ com instrumentação, repete os mesmos testes e produz:
+Os relatórios detalhados de linhas e ramificações ficam disponíveis em:
+- **C++ (`controlador/`)**: `build/relatorios/cpp/index.html`
+- **Python (`supervisor/` e `planta/`)**: `build/relatorios/python/index.html`
 
-- `build/relatorios/cpp/index.html`: linhas e ramificações do controlador C++;
-- `build/relatorios/python/index.html`: linhas e ramificações do Python;
-- `build/relatorios/LEIA-ME.md`: etapa e resultado da execução medida.
+---
 
-Abra os HTMLs localmente no navegador. Localize suas classes e métodos e encontre
-os caminhos não executados. No relatório Python, separe a planta pronta dos
-objetos escritos pela equipe: o percentual total da planta não demonstra que
-o seu código foi testado. Na base inicial, C++ pode aparecer com 0% e Streamlit
-com 0%, pois esses comportamentos ainda não foram implementados nem exercitados.
+## 7. Divisão de Trabalho e Limitações Conhecidas
 
-Na demonstração, rode `make test`, mostre seus casos passando e explique uma
-lacuna do relatório e como investigá-la. Uma condição pode executar e produzir
-resultado errado; por isso cobertura alta precisa acompanhar verificações de
-resultado. Não há percentual mínimo arbitrário nem promessa de qualidade por
-uma métrica isolada. A CI também gera os relatórios, disponíveis como artefato
-`cobertura` da execução correspondente ao commit.
-
-Mantenha no README da sua entrega uma matriz com **objeto/método, comportamento,
-teste, caso comum/fronteira/falha e lacuna conhecida**. Preserve as regressões
-anteriores ao acrescentar os casos da nova etapa.
-
-Os testes fornecidos verificam contratos observáveis e integração básica. Eles
-não provam a correção do controle, a aplicação de padrões, a qualidade da UML,
-a persistência nem o entendimento da equipe. Essas evidências dependem dos
-testes autorais, da inspeção do diff e da defesa. Workflows e testes são visíveis
-e editáveis no fork; CI verde não substitui a revisão técnica.
-
-## 7. Padrões e organização
-
-O controlador concentra as decisões de controle; serialização, arquivos e tela
-ficam em fronteiras próprias. Justifique os padrões a partir do problema.
-
-| Técnica/Padrão | Melhor uso | Esforço | Entregável | Limitação |
-|---|---|---|---|---|
-| Strategy | trocar a política mantendo a aquisição | médio | interface e políticas testadas | exige justificar as variações |
-| Command | representar atuações e seus ids | médio | solicitação verificável | não garante aplicação pela planta |
-| Repository | separar histórico e apresentação | médio | persistência testável | exige contrato de consulta |
-| Observer | notificar mudanças e alarmes | médio | notificações desacopladas | pode duplicar eventos se mal usado |
-
-Comece com Strategy quando variar a política; use Command se a solicitação de
-atuação precisar de identidade e rastreio. Para histórico, considere Repository.
-O esqueleto não determina sua hierarquia de classes.
-
-## 8. Diagnóstico
-
-- Arquivo ausente: execute a planta e confirme o diretório de trabalho.
-- Comando rejeitado: confira sessão, id, chaves e percentuais no contrato.
-- Atuadores voltam a zero: a validade é contada em ciclos; gere comandos novos
-  somente após novas aquisições e respeite o intervalo da planta.
-- Dados repetidos: sessão/ciclo identificam o snapshot; não duplique o histórico.
-- Biblioteca JSON C++ ausente: documente sua escolha e instalação no README e CI.
-
-Consulte [o contrato completo](docs/CONTRATO.md) antes de alterar a comunicação.
+- **Arquitetura e Documentação (`docs/ARQUITETURA_E_DECISOES.md`, UML e Contratos)**: Planejamento conjunto da dupla.
+- **Controlador C++ (`aquisicao`, `alarmes`, `telemetria`, `politicas`, `comando`, `controlador`) e Testes C++**: Implementação e verificação unitária em C++17.
+- **Supervisório Python (`supervisor/repositorio.py`, `supervisor/app.py`) e Testes Python**: Implementação do padrão `Repository` em SQLite, interface Streamlit e testes de integração fim-a-fim.
+- **Limitações Conhecidas**:
+  - A troca de dados por snapshots JSON substitui o estado mais recente a cada ciclo; caso o consumidor seja mais lento que o produtor, ciclos intermediários podem não ser observados (o histórico SQLite registra fielmente todos os ciclos observados sem prometê-los sem perdas).
+  - A escrita atômica via arquivo temporário e renomeação (`rename` / `os.replace`) garante documentos completos no mesmo sistema de arquivos local, mas não constitui transação distribuída.
