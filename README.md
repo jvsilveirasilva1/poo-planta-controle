@@ -215,6 +215,22 @@ classDiagram
 | `ComandoAtuacao` e `GestorComandos` | Requisito 4, 5 e 6 (padrão Command, confirmação, expiração, mesmo ciclo e nova sessão) | **Comum**: emissão ciclo 1 (`id=1`) e confirmação ciclo 2<br>**Fronteira**: releitura do ciclo 1; `comando_expirado` no ciclo 7<br>**Falha**: reinício de sessão (`sessao-B`) e `id <= 0` | Releitura do ciclo 1 retorna `false` (não renova comando); ciclo 2 confirma `id=1`; nova sessão reseta contador para `id=1`. | `tests/cpp/autorais_controle.cpp` | Persistência de estado é local em arquivo JSON, sem lock distribuído entre máquinas. |
 | `Controlador` / `processarCiclo` e `trocarPolitica` | Requisito 5 e 6 (integração C++, recuperação de arquivo inválido e troca de Strategy) | **Comum**: ciclo 1 -> `id=1`<br>**Falha**: `planta.json` corrompido no meio da operação<br>**Recuperação**: ciclo 2 válido após falha | Retorna erro `1` no JSON corrompido **preservando `telemetria.json` anterior** e retoma emissão normal (`id=2`) no ciclo 2. | `tests/cpp/autorais_controle.cpp` | Ramificações de erro de hardware de disco (`rename` falhando por permissão de SO) não ocorrem em execução normal. |
 | `ValidadorTelemetria` e `RepositorioTelemetria` | Requisito 8 e 9 (SQLite deduplicado por `sessao/ciclo`, exportação CSV e caminho E2E) | **Comum**: ciclos 1 e 2 no SQLite + exportação CSV<br>**Fronteira**: releitura/refresh da tela no mesmo `(sessao, ciclo)`<br>**Falha**: telemetria inválida após ciclo válido | `registrar_telemetria` retorna `False` na duplicata mantendo apenas 1 registro no SQLite; CSV exporta exatamente as linhas consultadas. | `tests/autorais_supervisor.py` | Consulta padrão limita-se aos últimos `200` ciclos na UI (`1000` no CSV) para manter responsividade. |
+| `BufferEnquadramentoTcp` / `ClienteTcpPlanta` / `ServidorTcpPlanta` | **Bônus TCP (+0,5 pt)**: troca preservando contratos, enquadramento, fragmentação, desconexão e recuperação | **Fragmentação**: JSON dividido em pacotes de 3 a 7 bytes<br>**Coalescência**: 2 JSONs no mesmo `recv()`<br>**Falha/Queda**: desconexão abrupta no meio do quadro e reconexão no ciclo seguinte | Reconstitui quadros completos no delimitador `\n`; descarta meio-quadro órfão ao desconectar; reconecta preservando `sessao`, `ciclo` e confirmando `id=1` -> `id=2`. | `tests/cpp/autorais_tcp.cpp` e `tests/autorais_supervisor.py` | Utiliza sockets locais IPv4 (`127.0.0.1`) sem criptografia TLS, adequado à execução local do contrato. |
+
+---
+
+## 5.1. Extensão Bônus TCP (Enquadramento, Fragmentação, Desconexão e Recuperação)
+
+Sem substituir a operação obrigatória por arquivos JSON locais, o projeto implementa o transporte TCP completo em C++ (`controlador/transporte_tcp.hpp` / `.cpp`) e Python (`supervisor/transporte_tcp.py`):
+
+1. **Enquadramento (*Framing* NDJSON)**:
+   - Como um socket TCP (`SOCK_STREAM`) é um fluxo contínuo de bytes sem fronteiras de mensagem nativas, cada documento JSON do contrato (`planta.json`, `comando_planta.json`, `telemetria.json`) é transmitido compactado em uma única linha finalizada pelo delimitador `\n` (*Newline-Delimited JSON*).
+2. **Tratamento de Fragmentação e Coalescência**:
+   - `BufferEnquadramentoTcp` (C++) e `EnquadradorTcp` (Python) acumulam bytes parciais recebidos em chamadas sucessivas de `recv()`. Se um JSON de 350 bytes chegar dividido em 50 pacotes pequenos, o enquadrador retém os fragmentos até encontrar `\n`, entregando o JSON íntegro ao `ValidadorAquisicao`. Se dois quadros chegarem colados no mesmo `recv()`, ambos são separados e processados em ordem. Um limite máximo (`64 KB`) protege contra estouro de memória caso um fluxo corrompido nunca envie `\n`.
+3. **Desconexão, Recuperação e Preservação de Sessão/Ciclo**:
+   - Caso a conexão caia no meio de uma transmissão parcial, `limparAoDesconectar()` descarta os bytes incompletos para não contaminar o primeiro quadro da nova conexão.
+   - Ao reconectar (`ClienteTcpPlanta::requisitarSnapshotPlanta`), o `Controlador` reconcilia a aquisição com `GestorComandos`: se a planta manteve a mesma `sessao`, a sequência de ciclos e `ultimo_comando` continua normalmente sem reiniciar IDs nem duplicar comandos; se a planta reiniciou, a nova `sessao` é detectada e reconciliada.
+   - Para executar o controlador via TCP: `./build/controlador --dados dados --tcp 127.0.0.1:PORTA [--uma-vez]`.
 
 ---
 
@@ -236,9 +252,16 @@ Os relatórios detalhados de linhas e ramificações ficam disponíveis em:
 
 ## 7. Divisão de Trabalho e Limitações Conhecidas
 
-- **Arquitetura e Documentação (`docs/ARQUITETURA_E_DECISOES.md`, UML e Contratos)**: Planejamento conjunto da dupla.
-- **Controlador C++ (`aquisicao`, `alarmes`, `telemetria`, `politicas`, `comando`, `controlador`) e Testes C++**: Implementação e verificação unitária em C++17.
-- **Supervisório Python (`supervisor/repositorio.py`, `supervisor/app.py`) e Testes Python**: Implementação do padrão `Repository` em SQLite, interface Streamlit e testes de integração fim-a-fim.
+- **Forks da Dupla e Reunião das Contribuições**:
+  - **Fork com Pipeline de PRs e CI Completa**: `https://github.com/jvsilveirasilva1/poo-planta-controle` (integração sequencial das 5 PRs incrementais `projeto/00-ambiente` → `projeto/04-entrega` com CI verde e artefatos de cobertura).
+  - **Fork do Colega**: `https://github.com/rcristelojr20/poo-planta-controle` (preservando autoria de `@rcristelojr20` nas etapas 00–04 com coautoria de `@jvsilveirasilva1` e commits exclusivos de `@jvsilveirasilva1` nas melhorias finais do supervisório, painel de simulação via `operador_comando.json` e documentação `docs/METRICAS_STREAMLIT.md`).
+- **Integrantes da Dupla**:
+  - **`@rcristelojr20`** (Autor principal dos commits das etapas 00 a 04 e do Bônus TCP)
+  - **`@jvsilveirasilva1`** (Coautor, autor dos commits finais de auto-refresh, simulação de falhas e `docs/METRICAS_STREAMLIT.md`, e responsável pela integração das PRs na `main`)
+- **Divisão das Entregas**:
+  - **Arquitetura e Documentação (`docs/ARQUITETURA_E_DECISOES.md`, `docs/METRICAS_STREAMLIT.md`, UML e Contratos)**: Planejamento e documentação pela dupla.
+  - **Controlador C++ (`aquisicao`, `alarmes`, `telemetria`, `politicas`, `comando`, `controlador`, `transporte_tcp`) e Testes C++**: Implementação e verificação unitária em C++17.
+  - **Supervisório Python (`supervisor/repositorio.py`, `supervisor/app.py`, `supervisor/transporte_tcp.py`) e Testes Python**: Implementação do padrão `Repository` em SQLite, interface Streamlit com auto-refresh (1s) e painel de simulação via `operador_comando.json`, servidor/cliente TCP e testes de integração fim-a-fim.
 - **Limitações Conhecidas**:
   - A troca de dados por snapshots JSON substitui o estado mais recente a cada ciclo; caso o consumidor seja mais lento que o produtor, ciclos intermediários podem não ser observados (o histórico SQLite registra fielmente todos os ciclos observados sem prometê-los sem perdas).
   - A escrita atômica via arquivo temporário e renomeação (`rename` / `os.replace`) garante documentos completos no mesmo sistema de arquivos local, mas não constitui transação distribuída.

@@ -12,6 +12,11 @@ from unittest.mock import patch
 
 from planta.simulador import Planta, gravar_json
 from supervisor.repositorio import RepositorioTelemetria, ValidadorTelemetria
+from supervisor.transporte_tcp import (
+    ClienteTcpSupervisor,
+    EnquadradorTcp,
+    ServidorTcpPlanta,
+)
 
 RAIZ = Path(__file__).resolve().parents[1]
 APP = RAIZ / "supervisor" / "app.py"
@@ -180,6 +185,87 @@ class TestCaminhoCompletoPlantaControladorTela(unittest.TestCase):
             self.assertEqual(len(historico), 1)
             self.assertEqual(historico[0]["ciclo"], 2)
             self.assertEqual(historico[0]["ultimo_comando"], 1)
+
+
+class TestBonusTcpIntegracao(unittest.TestCase):
+    def test_enquadrador_tcp_fragmentacao_coalescencia_e_overflow(self):
+        enq = EnquadradorTcp(tamanho_maximo=128)
+        quadro = EnquadradorTcp.enquadrar({"versao": 1, "ciclo": 10})
+        # Envia de 4 em 4 bytes
+        extraidos = []
+        for i in range(0, len(quadro), 4):
+            extraidos.extend(enq.receber_bytes(quadro[i : i + 4]))
+        self.assertEqual(len(extraidos), 1)
+        self.assertEqual(enq.bytes_pendentes, 0)
+
+        # Coalescência de dois quadros no mesmo pacote
+        duplo = EnquadradorTcp.enquadrar({"a": 1}) + EnquadradorTcp.enquadrar({"b": 2})
+        self.assertEqual(len(enq.receber_bytes(duplo)), 2)
+
+        # Fragmento incompleto limpo na desconexão
+        enq.receber_bytes(b'{"parcial":')
+        self.assertGreater(enq.bytes_pendentes, 0)
+        enq.limpar_ao_desconectar()
+        self.assertEqual(enq.bytes_pendentes, 0)
+
+        # Estouro de buffer sem '\n'
+        with self.assertRaises(BufferError):
+            enq.receber_bytes(b"X" * 200)
+
+    def test_integracao_tcp_planta_controlador_cpp_e_fragmentacao_em_socket(self):
+        import socket
+
+        with tempfile.TemporaryDirectory() as diretorio:
+            dados = Path(diretorio)
+            planta = Planta(seed=7, sessao="sessao-tcp-bonus")
+            servidor = ServidorTcpPlanta(planta, dados, host="127.0.0.1", porta=0)
+            servidor.iniciar_em_background()
+            self.addCleanup(servidor.encerrar)
+
+            bin_controlador = os.environ.get("POO_CONTROLADOR", str((RAIZ / "build/controlador").resolve()))
+            endereco = f"127.0.0.1:{servidor.porta}"
+
+            # 1. Controlador C++ conecta via TCP no ciclo 1 e envia comando id=1
+            res1 = subprocess.run(
+                [bin_controlador, "--dados", str(dados), "--tcp", endereco, "--uma-vez"],
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(res1.returncode, 0, f"Controlador TCP falhou: {res1.stderr}")
+
+            # 2. Planta avança para o ciclo 2 confirmando o comando id=1 recebido via TCP
+            estado_c2 = servidor.avancar_ciclo()
+            self.assertEqual(estado_c2["ultimo_comando"], 1)
+
+            # 3. Envia um comando fragmentado em pequenos pedaços via socket TCP direto e reconecta
+            cmd_frag = EnquadradorTcp.enquadrar(
+                {"versao": 1, "sessao": "sessao-tcp-bonus", "id": 2, "atuadores": {"bomba": 50.0, "aquecedor": 50.0}}
+            )
+            with socket.create_connection(("127.0.0.1", servidor.porta), timeout=2.0) as sock:
+                for i in range(0, len(cmd_frag), 7):
+                    sock.sendall(cmd_frag[i : i + 7])
+                resp = sock.recv(256)
+                self.assertIn(b'"status": "ok"', resp)
+
+            estado_c3 = servidor.avancar_ciclo()
+            self.assertEqual(estado_c3["ultimo_comando"], 2)
+
+            # 4. ClienteTcpSupervisor requisita a telemetria gerada pelo C++ via TCP
+            cliente_sup = ClienteTcpSupervisor("127.0.0.1", servidor.porta)
+            tel_tcp = cliente_sup.requisitar_json("OBTER_TELEMETRIA")
+            self.assertEqual(tel_tcp["sessao"], "sessao-tcp-bonus")
+
+
+class TestSimulacaoFalhaOperador(unittest.TestCase):
+    def test_gravar_comando_operador_e_rejeitar_modo_invalido(self):
+        from supervisor.app import gravar_comando_operador, ler_modo_operador_atual
+
+        with tempfile.TemporaryDirectory() as diretorio:
+            dados = Path(diretorio)
+            self.assertEqual(ler_modo_operador_atual(dados), "normal")
+            gravar_comando_operador(dados, "sobrecarga_termica")
+            self.assertEqual(ler_modo_operador_atual(dados), "sobrecarga_termica")
+            with self.assertRaises(ValueError):
+                gravar_comando_operador(dados, "modo_inexistente")
 
 
 if __name__ == "__main__":

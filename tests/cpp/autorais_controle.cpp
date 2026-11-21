@@ -242,6 +242,25 @@ void testarControladorIntegradoERecuperacaoDeArquivoInvalido() {
         fermentador::EmissorTelemetria::lerArquivoTexto(dir_temp / "comando_planta.json"));
     verificar(cmd2["id"] == 2, "ciclo 2 recuperado deve emitir comando id=2");
 
+    // Teste de operador_comando.json: falha_bomba -> {0,0}, sobrecarga_termica -> {100,100} e pausar_comandos
+    fermentador::EmissorTelemetria::gravarArquivoAtomico(
+        dir_temp / "operador_comando.json", R"({"versao":1,"modo":"falha_bomba"})");
+    const std::string json_ciclo3 = R"({
+        "versao": 1, "sessao": "sessao-int", "ciclo": 3, "timestamp": "2026-10-21T18:00:02Z",
+        "leituras": [
+            {"tag": "LT-01", "tipo": "nivel", "valor": 40.0, "unidade": "%", "status": "operando"},
+            {"tag": "TT-01", "tipo": "temperatura", "valor": 25.0, "unidade": "C", "status": "operando"}
+        ],
+        "atuadores": {"bomba": 50.0, "aquecedor": 50.0},
+        "ultimo_comando": 2, "erro_comando": null, "motivo_seguro": null
+    })";
+    fermentador::EmissorTelemetria::gravarArquivoAtomico(dir_temp / "planta.json", json_ciclo3);
+    verificar(ctrl.processarCiclo(dir_temp, instante + 2) == 0, "ciclo 3 com falha_bomba falhou");
+    const auto cmd3 = nlohmann::json::parse(
+        fermentador::EmissorTelemetria::lerArquivoTexto(dir_temp / "comando_planta.json"));
+    verificar(cmd3["id"] == 3 && cmd3["atuadores"]["bomba"] == 0.0 && cmd3["atuadores"]["aquecedor"] == 0.0,
+              "modo falha_bomba deve zerar atuadores no comando");
+
     std::filesystem::remove_all(dir_temp);
 }
 
